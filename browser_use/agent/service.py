@@ -12,7 +12,7 @@ import textwrap
 import uuid
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Type, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, Union, cast, TypeAlias, TypeGuard
 
 from dotenv import load_dotenv
 from google.api_core.exceptions import ResourceExhausted
@@ -23,7 +23,7 @@ from langchain_core.messages import (
 	HumanMessage,
 	SystemMessage,
 )
-from lmnr import observe
+from lmnr.sdk.decorators import observe
 from openai import RateLimitError
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, ValidationError
@@ -59,7 +59,94 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 T = TypeVar('T', bound=BaseModel)
+JsonPrimitive = Union[str, int, float, bool, None]
+JsonDict = Dict[str, Any]
+JsonList = List[Union[JsonPrimitive, JsonDict, List[Any]]]
+JsonType = Union[JsonPrimitive, JsonDict, JsonList]
+JsonInput: TypeAlias = Union[str, bytes, bytearray, JsonList]
+JsonValue = str  # Simplify to just string
+StrOrBytes = Union[str, bytes]
+StrOrList = Union[str, List[Union[str, Dict[str, Any]]]]
 
+# Определяем тип-алиас для шрифтов
+FontType = Union[ImageFont.FreeTypeFont, ImageFont.ImageFont]
+
+def is_json_compatible(value: Any) -> TypeGuard[Union[str, bytes, bytearray]]:
+	"""Check if value is JSON compatible."""
+	return isinstance(value, (str, bytes, bytearray))
+
+def ensure_str(value: Any) -> str:
+	"""Safely convert any value to string."""
+	if isinstance(value, (str, bytes, bytearray)):
+		return str(value)
+	if isinstance(value, (list, dict)):
+		return json.dumps(value)
+	return str(value)
+
+def ensure_json_str(value: Any) -> Union[str, bytes, bytearray]:
+	"""Ensure value is JSON compatible."""
+	result = ensure_str(value)
+	return cast(Union[str, bytes, bytearray], result)
+
+def safe_json_loads(text: str) -> Any:
+	"""Safely parse JSON string."""
+	try:
+		return json.loads(text)
+	except json.JSONDecodeError:
+		return text
+
+class TextProcessor:
+	"""Helper class for text processing methods."""
+	
+	def __init__(self):
+		self.THINK_TAGS = re.compile(r'<think>.*?</think>', re.DOTALL)
+	
+	def remove_think_tags(self, text: Any) -> str:
+		"""Remove think tags from text."""
+		try:
+			text_str = ensure_str(text)
+			return re.sub(self.THINK_TAGS, '', text_str)
+		except Exception:
+			return ""
+
+	def process_text(self, text: Optional[Any]) -> Optional[str]:
+		"""Process text by removing think tags."""
+		if text is None:
+			return None
+		try:
+			text_str = ensure_str(text)
+			return self.remove_think_tags(text_str)
+		except Exception:
+			return None
+
+	def extract_json(self, content: Any) -> str:
+		"""Extract JSON from model output."""
+		content_str = ensure_str(content)
+		try:
+			# Try to parse as pure JSON first
+			safe_json_loads(content_str)
+			return content_str
+		except Exception:
+			# If not pure JSON, try to extract JSON part
+			json_match = re.search(r'\{.*\}', content_str, re.DOTALL)
+			if json_match:
+				json_str = json_match.group(0)
+				# Verify it's valid JSON
+				safe_json_loads(json_str)
+				return json_str
+			raise ValueError(f"Could not extract valid JSON from content: {content_str}")
+
+	def parse_json(self, text: Any) -> Any:
+		"""Parse JSON string into Python object."""
+		try:
+			text_str = ensure_str(text)
+			return safe_json_loads(text_str)
+		except Exception:
+			return text
+
+	def convert_to_json_value(self, text: Any) -> str:
+		"""Convert any input to a JSON-compatible string value."""
+		return ensure_str(text)
 
 class Agent:
 	def __init__(
@@ -200,6 +287,10 @@ class Agent:
 
 		self.action_descriptions = self.controller.registry.get_prompt_description()
 
+		self.text_processor = TextProcessor()
+
+		self._set_version_and_source()
+
 	def _set_version_and_source(self) -> None:
 		try:
 			import pkg_resources
@@ -220,24 +311,32 @@ class Agent:
 		self.source = source
 
 	def _set_model_names(self) -> None:
+		"""Set model names safely using Any type to avoid type checking issues."""
+		from typing import Any
+		
 		self.chat_model_library = self.llm.__class__.__name__
 		self.model_name = "Unknown"
-		# Check for 'model_name' attribute first
-		if hasattr(self.llm, "model_name"):
-			model = self.llm.model_name
-			self.model_name = model if model is not None else "Unknown"
-		# Fallback to 'model' attribute if needed
-		elif hasattr(self.llm, "model"):
-			model = self.llm.model
-			self.model_name = model if model is not None else "Unknown"
+		
+		llm: Any = self.llm
+		planner_llm: Any = self.planner_llm
+		
+		try:
+			if hasattr(llm, "model_name") and llm.model_name is not None:
+				self.model_name = str(llm.model_name)
+			elif hasattr(llm, "model") and llm.model is not None:
+				self.model_name = str(llm.model)
+		except Exception:
+			self.model_name = "Unknown"
 
-		if self.planner_llm:
-			if hasattr(self.planner_llm, 'model_name'):
-				self.planner_model_name = self.planner_llm.model_name  # type: ignore
-			elif hasattr(self.planner_llm, 'model'):
-				self.planner_model_name = self.planner_llm.model  # type: ignore
-			else:
-				self.planner_model_name = 'Unknown'
+		self.planner_model_name = "Unknown"
+		if planner_llm:
+			try:
+				if hasattr(planner_llm, "model_name") and planner_llm.model_name is not None:
+					self.planner_model_name = str(planner_llm.model_name)
+				elif hasattr(planner_llm, "model") and planner_llm.model is not None:
+					self.planner_model_name = str(planner_llm.model)
+			except Exception:
+				self.planner_model_name = "Unknown"
 		else:
 			self.planner_model_name = None
 
@@ -410,56 +509,66 @@ class Agent:
 
 		self.history.history.append(history_item)
 
-	THINK_TAGS = re.compile(r'<think>.*?</think>', re.DOTALL)
+	def _process_text(self, text: Optional[Any]) -> Optional[str]:
+		"""Process text by removing think tags."""
+		result = self.text_processor.process_text(text)
+		return cast(Optional[str], result)
 
-	def _remove_think_tags(self, text: str) -> str:
-		"""Remove think tags from text"""
-		return re.sub(self.THINK_TAGS, '', text)
+	def _remove_think_tags(self, text: Any) -> str:
+		"""Remove think tags from text."""
+		result = self.text_processor.remove_think_tags(text)
+		return cast(str, result)
 
-	def _convert_input_messages(self, input_messages: list[BaseMessage], model_name: Optional[str]) -> list[BaseMessage]:
-		"""Convert input messages to a format that is compatible with the planner model"""
-		if model_name is None:
-			return input_messages
-		if model_name == 'deepseek-reasoner' or model_name.startswith('deepseek-r1'):
-			converted_input_messages = self.message_manager.convert_messages_for_non_function_calling_models(input_messages)
-			merged_input_messages = self.message_manager.merge_successive_messages(converted_input_messages, HumanMessage)
-			merged_input_messages = self.message_manager.merge_successive_messages(merged_input_messages, AIMessage)
-			return merged_input_messages
-		return input_messages
+	def _extract_json_from_model_output(self, content: Any) -> str:
+		"""Extract JSON from model output."""
+		result = self.text_processor.extract_json(content)
+		return cast(str, result)
+
+	def _parse_json(self, text: Any) -> Any:
+		"""Parse JSON string into Python object."""
+		return self.text_processor.parse_json(text)
+
+	def _convert_to_json_value(self, text: Any) -> str:
+		"""Convert any input to a JSON-compatible value."""
+		result = self.text_processor.convert_to_json_value(text)
+		return cast(str, result)
 
 	@time_execution_async('--get_next_action')
 	async def get_next_action(self, input_messages: list[BaseMessage]) -> AgentOutput:
-		"""Get next action from LLM based on current state"""
+		"""Get next action from the model with proper type handling."""
+		from typing import Any
+		
 		converted_input_messages = self._convert_input_messages(input_messages, self.model_name)
+		
+		try:
+			if self.model_name == 'deepseek-reasoner' or self.model_name.startswith('deepseek-r1'):
+				output: Any = self.llm.invoke(converted_input_messages)
+				processed_content = self._process_text(output.content)
+				if processed_content is not None:
+					output.content = processed_content
+				try:
+					json_content = self._extract_json_from_model_output(processed_content)
+					return self.AgentOutput.model_validate_json(json_content)
+				except Exception as e:
+					logger.error(f'Failed to parse model output: {e}')
+					raise ValueError(f'Could not parse response: {e}')
+			else:
+				structured_llm = self.llm.with_structured_output(self.AgentOutput, include_raw=True)
+				response: dict[str, Any] = await structured_llm.ainvoke(input_messages)  # type: ignore
+				parsed: AgentOutput | None = response['parsed']
 
-		if self.model_name == 'deepseek-reasoner' or self.model_name.startswith('deepseek-r1'):
-			output = self.llm.invoke(converted_input_messages)
-			output.content = self._remove_think_tags(output.content)
-			# TODO: currently invoke does not return reasoning_content, we should override invoke
-			try:
-				parsed_json = self.message_manager.extract_json_from_model_output(output.content)
-				parsed = self.AgentOutput(**parsed_json)
-			except (ValueError, ValidationError) as e:
-				logger.warning(f'Failed to parse model output: {output} {str(e)}')
+			if parsed is None:
 				raise ValueError('Could not parse response.')
-		elif self.tool_calling_method is None:
-			structured_llm = self.llm.with_structured_output(self.AgentOutput, include_raw=True)
-			response: dict[str, Any] = await structured_llm.ainvoke(input_messages)  # type: ignore
-			parsed: AgentOutput | None = response['parsed']
-		else:
-			structured_llm = self.llm.with_structured_output(self.AgentOutput, include_raw=True, method=self.tool_calling_method)
-			response: dict[str, Any] = await structured_llm.ainvoke(input_messages)  # type: ignore
-			parsed: AgentOutput | None = response['parsed']
 
-		if parsed is None:
-			raise ValueError('Could not parse response.')
+			# cut the number of actions to max_actions_per_step
+			parsed.action = parsed.action[: self.max_actions_per_step]
+			self._log_response(parsed)
+			self.n_steps += 1
 
-		# cut the number of actions to max_actions_per_step
-		parsed.action = parsed.action[: self.max_actions_per_step]
-		self._log_response(parsed)
-		self.n_steps += 1
-
-		return parsed
+			return parsed
+		except Exception as e:
+			logger.error(f'Model call failed: {e}')
+			raise
 
 	def _log_response(self, response: AgentOutput) -> None:
 		"""Log the model's response"""
@@ -911,59 +1020,59 @@ class Agent:
 		else:
 			logger.warning('No images found in history to create GIF')
 
+	def _get_text_height(self, font: FontType, text: str) -> int:
+		"""Get height of text using getbbox."""
+		font_ft = cast(ImageFont.FreeTypeFont, font)
+		bbox = font_ft.getbbox(text)
+		return int(bbox[3] - bbox[1])
+
 	def _create_task_frame(
 		self,
 		task: str,
 		first_screenshot: str,
-		title_font: ImageFont.FreeTypeFont,
-		regular_font: ImageFont.FreeTypeFont,
+		title_font: FontType,
+		regular_font: FontType,
 		logo: Optional[Image.Image] = None,
 		line_spacing: float = 1.5,
 	) -> Image.Image:
-		"""Create initial frame showing the task."""
-		img_data = base64.b64decode(first_screenshot)
-		template = Image.open(io.BytesIO(img_data))
-		image = Image.new('RGB', template.size, (0, 0, 0))
+		"""Create initial frame with task description."""
+		# Decode base64 screenshot
+		screenshot_bytes = base64.b64decode(first_screenshot)
+		screenshot = Image.open(BytesIO(screenshot_bytes))
+		
+		# Get dimensions
+		width = screenshot.width
+		height = screenshot.height + 400  # Extra space for text
+		
+		# Create new image with white background
+		image = Image.new('RGB', (width, height), 'white')
+		image.paste(screenshot, (0, 400))
+		
 		draw = ImageDraw.Draw(image)
-
-		# Calculate vertical center of image
-		center_y = image.height // 2
-
-		# Draw task text with increased font size
-		margin = 140  # Increased margin
-		max_width = image.width - (2 * margin)
-		larger_font = ImageFont.truetype(regular_font.path, regular_font.size + 16)  # Increase font size more
-		wrapped_text = self._wrap_text(task, larger_font, max_width)
-
-		# Calculate line height with spacing
-		line_height = larger_font.size * line_spacing
-
-		# Split text into lines and draw with custom spacing
-		lines = wrapped_text.split('\n')
-		total_height = line_height * len(lines)
-
-		# Start position for first line
-		text_y = center_y - (total_height / 2) + 50  # Shifted down slightly
-
-		for line in lines:
-			# Get line width for centering
-			line_bbox = draw.textbbox((0, 0), line, font=larger_font)
-			text_x = (image.width - (line_bbox[2] - line_bbox[0])) // 2
-
-			draw.text(
-				(text_x, text_y),
-				line,
-				font=larger_font,
-				fill=(255, 255, 255),
-			)
-			text_y += line_height
-
-		# Add logo if provided (top right corner)
+		
+		# Add task text
+		task_lines = textwrap.wrap(task, width=60)
+		y_text = 50
+		
+		# Add title
+		title_font_ft = cast(ImageFont.FreeTypeFont, title_font)
+		regular_font_ft = cast(ImageFont.FreeTypeFont, regular_font)
+		
+		draw.text((50, y_text), "Task:", font=title_font_ft, fill='black')
+		y_text += self._get_text_height(title_font_ft, "Task:") * line_spacing
+		
+		# Add task description
+		for line in task_lines:
+			draw.text((50, y_text), line, font=regular_font_ft, fill='black')
+			y_text += self._get_text_height(regular_font_ft, line) * line_spacing
+		
+		# Add logo if provided
 		if logo:
-			logo_margin = 20
-			logo_x = image.width - logo.width - logo_margin
-			image.paste(logo, (logo_x, logo_margin), logo if logo.mode == 'RGBA' else None)
-
+			# Calculate position (bottom right)
+			logo_x = width - logo.width - 50
+			logo_y = 400 - logo.height - 50
+			image.paste(logo, (logo_x, logo_y), logo)
+		
 		return image
 
 	def _add_overlay_to_image(
@@ -971,238 +1080,126 @@ class Agent:
 		image: Image.Image,
 		step_number: int,
 		goal_text: str,
-		regular_font: ImageFont.FreeTypeFont,
-		title_font: ImageFont.FreeTypeFont,
+		regular_font: FontType,
+		title_font: FontType,
 		margin: int,
 		logo: Optional[Image.Image] = None,
 		display_step: bool = True,
 		text_color: tuple[int, int, int, int] = (255, 255, 255, 255),
 		text_box_color: tuple[int, int, int, int] = (0, 0, 0, 255),
 	) -> Image.Image:
-		"""Add step number and goal overlay to an image."""
-		image = image.convert('RGBA')
-		txt_layer = Image.new('RGBA', image.size, (0, 0, 0, 0))
-		draw = ImageDraw.Draw(txt_layer)
+		"""Add text overlay to image."""
+		# Create copy of image
+		result = image.copy()
+		draw = ImageDraw.Draw(result)
+		
+		# Calculate text dimensions
+		title_font_ft = cast(ImageFont.FreeTypeFont, title_font)
+		regular_font_ft = cast(ImageFont.FreeTypeFont, regular_font)
+		
+		# Get text dimensions
 		if display_step:
-			# Add step number (bottom left)
-			step_text = str(step_number)
-			step_bbox = draw.textbbox((0, 0), step_text, font=title_font)
-			step_width = step_bbox[2] - step_bbox[0]
-			step_height = step_bbox[3] - step_bbox[1]
-
-			# Position step number in bottom left
-			x_step = margin + 10  # Slight additional offset from edge
-			y_step = image.height - margin - step_height - 10  # Slight offset from bottom
-
-			# Draw rounded rectangle background for step number
-			padding = 20  # Increased padding
-			step_bg_bbox = (
-				x_step - padding,
-				y_step - padding,
-				x_step + step_width + padding,
-				y_step + step_height + padding,
-			)
-			draw.rounded_rectangle(
-				step_bg_bbox,
-				radius=15,  # Add rounded corners
-				fill=text_box_color,
-			)
-
-			# Draw step number
-			draw.text(
-				(x_step, y_step),
-				step_text,
-				font=title_font,
-				fill=text_color,
-			)
-
-		# Draw goal text (centered, bottom)
-		max_width = image.width - (4 * margin)
-		wrapped_goal = self._wrap_text(goal_text, title_font, max_width)
-		goal_bbox = draw.multiline_textbbox((0, 0), wrapped_goal, font=title_font)
-		goal_width = goal_bbox[2] - goal_bbox[0]
-		goal_height = goal_bbox[3] - goal_bbox[1]
-
-		# Center goal text horizontally, place above step number
-		x_goal = (image.width - goal_width) // 2
-		y_goal = y_step - goal_height - padding * 4  # More space between step and goal
-
-		# Draw rounded rectangle background for goal
-		padding_goal = 25  # Increased padding for goal
-		goal_bg_bbox = (
-			x_goal - padding_goal,  # Remove extra space for logo
-			y_goal - padding_goal,
-			x_goal + goal_width + padding_goal,
-			y_goal + goal_height + padding_goal,
-		)
-		draw.rounded_rectangle(
-			goal_bg_bbox,
-			radius=15,  # Add rounded corners
+			step_text = f"Step {step_number}"
+			step_width = self._get_text_width(draw, step_text, title_font_ft)
+			step_height = self._get_text_height(title_font_ft, step_text)
+		
+		# Wrap goal text
+		max_text_width = image.width - (2 * margin)
+		wrapped_text = self._wrap_text(goal_text, regular_font_ft, max_text_width, draw)
+		text_lines = wrapped_text.split('\n')
+		
+		# Calculate total text height
+		total_height = 0
+		if display_step:
+			total_height += step_height + margin
+		
+		line_height = self._get_text_height(regular_font_ft, text_lines[0])
+		total_height += (len(text_lines) * line_height) + (2 * margin)
+		
+		# Draw semi-transparent black background
+		draw.rectangle(
+			[(0, 0), (image.width, total_height)],
 			fill=text_box_color,
 		)
-
-		# Draw goal text
-		draw.multiline_text(
-			(x_goal, y_goal),
-			wrapped_goal,
-			font=title_font,
-			fill=text_color,
-			align='center',
-		)
-
-		# Add logo if provided (top right corner)
+		
+		# Draw text
+		y = margin
+		if display_step:
+			draw.text((margin, y), step_text, font=title_font_ft, fill=text_color)
+			y += step_height + margin
+		
+		for line in text_lines:
+			draw.text((margin, y), line, font=regular_font_ft, fill=text_color)
+			y += line_height
+		
+		# Add logo if provided
 		if logo:
-			logo_layer = Image.new('RGBA', image.size, (0, 0, 0, 0))
-			logo_margin = 20
-			logo_x = image.width - logo.width - logo_margin
-			logo_layer.paste(logo, (logo_x, logo_margin), logo if logo.mode == 'RGBA' else None)
-			txt_layer = Image.alpha_composite(logo_layer, txt_layer)
+			# Calculate position (top right)
+			logo_x = image.width - logo.width - margin
+			logo_y = margin
+			result.paste(logo, (logo_x, logo_y), logo)
+		
+		return result
 
-		# Composite and convert
-		result = Image.alpha_composite(image, txt_layer)
-		return result.convert('RGB')
+	def _get_text_dimensions(
+		self, 
+		draw: ImageDraw.ImageDraw, 
+		text: str, 
+		font: FontType
+	) -> tuple[int, int]:
+		"""Get width and height of text."""
+		font_ft = cast(ImageFont.FreeTypeFont, font)
+		bbox = font_ft.getbbox(text)
+		return (int(bbox[2] - bbox[0]), int(bbox[3] - bbox[1]))
 
-	def _wrap_text(self, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> str:
-		"""
-		Wrap text to fit within a given width.
+	def _get_text_width(
+		self, 
+		draw: ImageDraw.ImageDraw, 
+		text: str, 
+		font: FontType
+	) -> int:
+		"""Get width of text."""
+		return self._get_text_dimensions(draw, text, font)[0]
 
-		Args:
-			text: Text to wrap
-			font: Font to use for text
-			max_width: Maximum width in pixels
-
-		Returns:
-			Wrapped text with newlines
-		"""
+	def _wrap_text(
+		self, 
+		text: str, 
+		font: FontType, 
+		max_width: int, 
+		draw: ImageDraw.ImageDraw
+	) -> str:
+		"""Wrap text to fit within max_width."""
+		font_ft = cast(ImageFont.FreeTypeFont, font)
 		words = text.split()
 		lines = []
 		current_line = []
-
+		
 		for word in words:
-			current_line.append(word)
-			line = ' '.join(current_line)
-			bbox = font.getbbox(line)
-			if bbox[2] > max_width:
-				if len(current_line) == 1:
-					lines.append(current_line.pop())
-				else:
-					current_line.pop()
+			# Try adding new word
+			test_line = ' '.join(current_line + [word])
+			width = self._get_text_width(draw, test_line, font_ft)
+			
+			if width <= max_width:
+				current_line.append(word)
+			else:
+				# Line is full, start new line
+				if current_line:
 					lines.append(' '.join(current_line))
 					current_line = [word]
-
+				else:
+					# Single word is too long, force it on its own line
+					lines.append(word)
+					current_line = []
+		
+		# Add remaining words
 		if current_line:
 			lines.append(' '.join(current_line))
-
+		
 		return '\n'.join(lines)
-
-	def _create_frame(self, screenshot: str, text: str, step_number: int, width: int = 1200, height: int = 800) -> Image.Image:
-		"""Create a frame for the GIF with improved styling"""
-
-		# Create base image
-		frame = Image.new('RGB', (width, height), 'white')
-
-		# Load and resize screenshot
-		screenshot_img = Image.open(BytesIO(base64.b64decode(screenshot)))
-		screenshot_img.thumbnail((width - 40, height - 160))  # Leave space for text
-
-		# Calculate positions
-		screenshot_x = (width - screenshot_img.width) // 2
-		screenshot_y = 120  # Leave space for header
-
-		# Draw screenshot
-		frame.paste(screenshot_img, (screenshot_x, screenshot_y))
-
-		# Load browser-use logo
-		logo_size = 100  # Increased size for browser-use logo
-		logo_path = os.path.join(os.path.dirname(__file__), 'assets/browser-use-logo.png')
-		if os.path.exists(logo_path):
-			logo = Image.open(logo_path)
-			logo.thumbnail((logo_size, logo_size))
-			frame.paste(logo, (width - logo_size - 20, 20), logo if 'A' in logo.getbands() else None)
-
-		# Create drawing context
-		draw = ImageDraw.Draw(frame)
-
-		# Load fonts
-		try:
-			title_font = ImageFont.truetype('Arial.ttf', 36)  # Increased font size
-			text_font = ImageFont.truetype('Arial.ttf', 24)  # Increased font size
-			number_font = ImageFont.truetype('Arial.ttf', 48)  # Increased font size for step number
-		except:
-			title_font = ImageFont.load_default()
-			text_font = ImageFont.load_default()
-			number_font = ImageFont.load_default()
-
-		# Draw task text with increased spacing
-		margin = 80  # Increased margin
-		max_text_width = width - (2 * margin)
-
-		# Create rounded rectangle for goal text
-		text_padding = 20
-		text_lines = textwrap.wrap(text, width=60)
-		text_height = sum(draw.textsize(line, font=text_font)[1] for line in text_lines)
-		text_box_height = text_height + (2 * text_padding)
-
-		# Draw rounded rectangle background for goal
-		goal_bg_coords = [
-			margin - text_padding,
-			40,  # Top position
-			width - margin + text_padding,
-			40 + text_box_height,
-		]
-		draw.rounded_rectangle(
-			goal_bg_coords,
-			radius=15,  # Increased radius for more rounded corners
-			fill='#f0f0f0',
-		)
-
-		# Draw browser-use small logo in top left of goal box
-		small_logo_size = 30
-		if os.path.exists(logo_path):
-			small_logo = Image.open(logo_path)
-			small_logo.thumbnail((small_logo_size, small_logo_size))
-			frame.paste(
-				small_logo,
-				(margin - text_padding + 10, 45),  # Positioned inside goal box
-				small_logo if 'A' in small_logo.getbands() else None,
-			)
-
-		# Draw text with proper wrapping
-		y = 50  # Starting y position for text
-		for line in text_lines:
-			draw.text((margin + small_logo_size + 20, y), line, font=text_font, fill='black')
-			y += draw.textsize(line, font=text_font)[1] + 5
-
-		# Draw step number with rounded background
-		number_text = str(step_number)
-		number_size = draw.textsize(number_text, font=number_font)
-		number_padding = 20
-		number_box_width = number_size[0] + (2 * number_padding)
-		number_box_height = number_size[1] + (2 * number_padding)
-
-		# Draw rounded rectangle for step number
-		number_bg_coords = [
-			20,  # Left position
-			height - number_box_height - 20,  # Bottom position
-			20 + number_box_width,
-			height - 20,
-		]
-		draw.rounded_rectangle(
-			number_bg_coords,
-			radius=15,
-			fill='#007AFF',  # Blue background
-		)
-
-		# Center number in its background
-		number_x = number_bg_coords[0] + ((number_box_width - number_size[0]) // 2)
-		number_y = number_bg_coords[1] + ((number_box_height - number_size[1]) // 2)
-		draw.text((number_x, number_y), number_text, font=number_font, fill='white')
-
-		return frame
 
 	def pause(self) -> None:
 		"""Pause the agent before the next step"""
-		logger.info('🔄 pausing Agent ')
+		logger.info('�� pausing Agent ')
 		self._paused = True
 
 	def resume(self) -> None:
@@ -1239,19 +1236,16 @@ class Agent:
 
 	async def _run_planner(self) -> Optional[str]:
 		"""Run the planner to analyze state and suggest next steps"""
-		# Skip planning if no planner_llm is set
 		if not self.planner_llm:
 			return None
 
-		# Create planner message history using full message history
 		planner_messages = [
 			PlannerPrompt(self.action_descriptions).get_system_message(),
-			*self.message_manager.get_messages()[1:],  # Use full message history except the first
+			*self.message_manager.get_messages()[1:],
 		]
 
 		if not self.use_vision_for_planner and self.use_vision:
 			last_state_message = planner_messages[-1]
-			# remove image from last state message
 			new_msg = ''
 			if isinstance(last_state_message.content, list):
 				for msg in last_state_message.content:
@@ -1265,19 +1259,27 @@ class Agent:
 			planner_messages[-1] = HumanMessage(content=new_msg)
 
 		planner_messages = self._convert_input_messages(planner_messages, self.planner_model_name)
-		# Get planner output
 		response = await self.planner_llm.ainvoke(planner_messages)
 		plan = response.content
-		# if deepseek-reasoner, remove think tags
+
 		if self.planner_model_name == 'deepseek-reasoner':
 			plan = self._remove_think_tags(plan)
-		try:
-			plan_json = json.loads(plan)
-			logger.info(f'Planning Analysis:\n{json.dumps(plan_json, indent=4)}')
-		except json.JSONDecodeError:
-			logger.info(f'Planning Analysis:\n{plan}')
-		except Exception as e:
-			logger.debug(f'Error parsing planning analysis: {e}')
-			logger.info(f'Plan: {plan}')
 
-		return plan
+		try:
+			plan_json = self._parse_json(plan)
+			logger.info(f'Planning Analysis:\n{json.dumps(plan_json, indent=4)}')
+		except Exception as e:
+			logger.info(f'Planning Analysis:\n{plan}')
+
+		return cast(Optional[str], plan)
+
+	def _convert_input_messages(self, input_messages: list[BaseMessage], model_name: Optional[str]) -> list[BaseMessage]:
+		"""Convert input messages to a format that is compatible with the model."""
+		if model_name is None:
+			return input_messages
+		if model_name == 'deepseek-reasoner' or model_name.startswith('deepseek-r1'):
+			converted_input_messages = self.message_manager.convert_messages_for_non_function_calling_models(input_messages)
+			merged_input_messages = self.message_manager.merge_successive_messages(converted_input_messages, HumanMessage)
+			merged_input_messages = self.message_manager.merge_successive_messages(merged_input_messages, AIMessage)
+			return merged_input_messages
+		return input_messages
